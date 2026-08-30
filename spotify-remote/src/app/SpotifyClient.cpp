@@ -35,8 +35,16 @@ constexpr uint32_t kWakeSettleMs = 900;
 constexpr uint32_t kErrorBackoffMs = 5000;
 
 NowPlaying state;
+DeviceList devices;
 SemaphoreHandle_t state_mutex = nullptr;
 QueueHandle_t command_queue = nullptr;
+
+// SelectDevice needs to name a device, so the queue carries a payload rather
+// than a bare enum.
+struct QueuedCommand {
+    Command command;
+    char device_id[64];
+};
 
 Preferences prefs;
 String access_token;
@@ -95,6 +103,11 @@ void rememberDevice(const String &id, const String &name) {
     last_device_name = name;
     prefs.putString("device", id);
     prefs.putString("devname", name);
+    if (state_mutex) {
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        strlcpy(devices.preferred_id, id.c_str(), sizeof(devices.preferred_id));
+        xSemaphoreGive(state_mutex);
+    }
     log_i("remembering device \"%s\"", name.c_str());
 }
 
@@ -343,57 +356,119 @@ bool pollPlayerState() {
 
 // --- waking an idle device ------------------------------------------------
 
-// Picks something controllable from the account's visible devices. Restricted
-// devices appear in the list but reject Web API control, so they are skipped.
-bool resolveDevice(String &out_id, String &out_name) {
+// Reads every device Spotify can currently see into `devices`. The live list is
+// the honest one: a device Spotify cannot see cannot be transferred to either,
+// so there is nothing to gain from remembering ones that have gone away.
+bool fetchDevices() {
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    devices.loading = true;
+    xSemaphoreGive(state_mutex);
+
     HTTPClient http;
     http.setTimeout(10000);
     http.setReuse(true);
-    if (!http.begin(api_client, kDevicesUrl)) return false;
-    http.addHeader("Authorization", "Bearer " + access_token);
+    bool ok = false;
+    String body;
+    int code = -1;
 
-    const int code = http.GET();
-    const String body = hasBody(http, code) ? http.getString() : String();
-    http.end();
-    if (code != HTTP_CODE_OK) {
+    if (http.begin(api_client, kDevicesUrl)) {
+        http.addHeader("Authorization", "Bearer " + access_token);
+        code = http.GET();
+        body = hasBody(http, code) ? http.getString() : String();
+        http.end();
+        ok = code == HTTP_CODE_OK;
+    }
+    if (!ok) {
         log_w("device list HTTP %d: %s", code, body.c_str());
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        devices.loading = false;
+        xSemaphoreGive(state_mutex);
         return false;
     }
 
     JsonDocument filter;
-    JsonObject device = filter["devices"][0].to<JsonObject>();
-    device["id"] = true;
-    device["name"] = true;
-    device["is_active"] = true;
-    device["is_restricted"] = true;
+    JsonObject shape = filter["devices"][0].to<JsonObject>();
+    shape["id"] = true;
+    shape["name"] = true;
+    shape["type"] = true;
+    shape["is_active"] = true;
+    shape["is_restricted"] = true;
 
     JsonDocument doc;
-    if (deserializeJson(doc, body, DeserializationOption::Filter(filter))) return false;
+    if (deserializeJson(doc, body, DeserializationOption::Filter(filter))) {
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        devices.loading = false;
+        xSemaphoreGive(state_mutex);
+        return false;
+    }
 
-    // Prefer one that is already active, then the one we remember by name, then
-    // anything controllable at all.
-    JsonObjectConst best;
-    int best_rank = 4;
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    devices.count = 0;
     for (JsonObjectConst candidate : doc["devices"].as<JsonArrayConst>()) {
-        if (candidate["is_restricted"] | false) continue;
+        if (devices.count >= kMaxDevices) break;
         const char *id = candidate["id"];
-        if (!id || !*id) continue;
-        const char *name = candidate["name"] | "";
-        const int rank = (candidate["is_active"] | false) ? 1
-                         : (last_device_name == name)     ? 2
-                                                          : 3;
+        if (!id || !*id) continue;  // a device with no id cannot be targeted
+        Device &slot = devices.items[devices.count++];
+        strlcpy(slot.id, id, sizeof(slot.id));
+        strlcpy(slot.name, candidate["name"] | "Unknown", sizeof(slot.name));
+        strlcpy(slot.type, candidate["type"] | "", sizeof(slot.type));
+        slot.active = candidate["is_active"] | false;
+        slot.restricted = candidate["is_restricted"] | false;
+    }
+    devices.loading = false;
+    ++devices.generation;
+    strlcpy(devices.preferred_id, last_device_id.c_str(), sizeof(devices.preferred_id));
+    const uint8_t count = devices.count;
+    xSemaphoreGive(state_mutex);
+
+    log_i("%u device(s) visible to Spotify", count);
+    return true;
+}
+
+// Picks the best device to wake: one already active, then the one we remember,
+// then anything controllable. Restricted devices are listed by Spotify but
+// reject Web API control, so they are never chosen.
+bool resolveDevice(String &out_id, String &out_name) {
+    if (!fetchDevices()) return false;
+
+    DeviceList snapshot_list;
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    snapshot_list = devices;
+    xSemaphoreGive(state_mutex);
+
+    int best = -1, best_rank = 4;
+    for (uint8_t i = 0; i < snapshot_list.count; ++i) {
+        const Device &candidate = snapshot_list.items[i];
+        if (candidate.restricted) continue;
+        const int rank = candidate.active                        ? 1
+                         : (last_device_name == candidate.name)  ? 2
+                                                                 : 3;
         if (rank < best_rank) {
             best_rank = rank;
-            best = candidate;
+            best = i;
         }
     }
-    if (best.isNull()) {
+    if (best < 0) {
         log_w("no controllable device is visible to Spotify");
         return false;
     }
-    out_id = best["id"].as<const char *>();
-    out_name = best["name"] | "";
+    out_id = snapshot_list.items[best].id;
+    out_name = snapshot_list.items[best].name;
     return true;
+}
+
+// Looks up a device's display name so a manual pick can be remembered by name.
+String nameForDevice(const char *id) {
+    String name;
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    for (uint8_t i = 0; i < devices.count; ++i) {
+        if (strcmp(devices.items[i].id, id) == 0) {
+            name = devices.items[i].name;
+            break;
+        }
+    }
+    xSemaphoreGive(state_mutex);
+    return name;
 }
 
 // PUT /me/player moves playback to a device, and with play=true starts it.
@@ -436,8 +511,24 @@ bool wakeDevice(bool start_playing) {
 
 // --- transport ------------------------------------------------------------
 
-bool runCommand(Command command) {
+bool runCommand(const QueuedCommand &queued) {
     if (!ensureAccessToken()) return false;
+    const Command command = queued.command;
+
+    if (command == Command::RefreshDevices) return fetchDevices();
+
+    if (command == Command::SelectDevice) {
+        bool keep_playing;
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        // Keep playing if it already was; if nothing is going, selecting a
+        // device is a request to start there.
+        keep_playing = state.is_playing || !state.has_track;
+        xSemaphoreGive(state_mutex);
+
+        if (!transferTo(queued.device_id, keep_playing)) return false;
+        rememberDevice(queued.device_id, nameForDevice(queued.device_id));
+        return true;
+    }
 
     if (currentStatus() == Status::NoActiveDevice) {
         // Transferring playback with play=true *is* the play action, so a
@@ -461,6 +552,8 @@ bool runCommand(Command command) {
             url += snapshot_playing ? "pause" : "play";
             use_put = true;
             break;
+        default:
+            return false;  // handled above
     }
 
     HTTPClient http;
@@ -519,9 +612,9 @@ void task(void *) {
             continue;
         }
 
-        Command command;
-        if (xQueueReceive(command_queue, &command, 0) == pdTRUE) {
-            if (runCommand(command)) {
+        QueuedCommand queued;
+        if (xQueueReceive(command_queue, &queued, 0) == pdTRUE) {
+            if (runCommand(queued)) {
                 next_poll_ms = millis() + kSettleDelayMs;
             }
             continue;
@@ -561,7 +654,7 @@ void task(void *) {
 
 bool begin() {
     state_mutex = xSemaphoreCreateMutex();
-    command_queue = xQueueCreate(8, sizeof(Command));
+    command_queue = xQueueCreate(8, sizeof(QueuedCommand));
     if (!state_mutex || !command_queue) return false;
 
     net::secure(api_client);
@@ -577,9 +670,24 @@ void snapshot(app::NowPlaying &out) {
     xSemaphoreGive(state_mutex);
 }
 
+void deviceSnapshot(DeviceList &out) {
+    if (!state_mutex) return;
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    out = devices;
+    xSemaphoreGive(state_mutex);
+}
+
 bool send(Command command) {
     if (!command_queue) return false;
-    return xQueueSend(command_queue, &command, 0) == pdTRUE;
+    QueuedCommand queued{command, {}};
+    return xQueueSend(command_queue, &queued, 0) == pdTRUE;
+}
+
+bool selectDevice(const char *device_id) {
+    if (!command_queue || !device_id || !*device_id) return false;
+    QueuedCommand queued{Command::SelectDevice, {}};
+    strlcpy(queued.device_id, device_id, sizeof(queued.device_id));
+    return xQueueSend(command_queue, &queued, 0) == pdTRUE;
 }
 
 }  // namespace spotify

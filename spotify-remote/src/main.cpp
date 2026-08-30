@@ -20,8 +20,15 @@ constexpr uint8_t kBrightnessPercent = 85;
 constexpr uint32_t kBatteryIntervalMs = 30000;
 constexpr uint32_t kIdleTimeoutMs = 120000;  // blank the panel after two idle minutes
 constexpr uint32_t kFrameIntervalMs = 33;    // ~30 fps ceiling; we redraw far less than that
+constexpr uint32_t kPickerTimeoutMs = 20000; // close the picker if it is left open
+constexpr uint32_t kBootDebounceMs = 40;
 
 ui::Button pressed_button = ui::Button::None;
+int picker_pressed = ui::kPickerNone;
+spotify::DeviceList device_list;
+uint32_t picker_active_ms = 0;
+bool boot_was_down = false;
+uint32_t boot_changed_ms = 0;
 bool suppress_press = false;  // set when a touch was consumed by waking the screen
 
 hardware::Battery battery;
@@ -30,6 +37,33 @@ uint32_t last_frame_ms = 0;
 uint32_t last_activity_ms = 0;
 bool display_asleep = false;
 bool last_seen_playing = false;
+
+// BOOT opens the device picker; pressing it again pages through the list when
+// there are more devices than fit on one screen.
+void handleBootButton() {
+    const bool down = hardware::bootButtonPressed();
+    const uint32_t now = millis();
+
+    if (down != boot_was_down) {
+        if (now - boot_changed_ms < kBootDebounceMs) return;  // contact bounce
+        boot_changed_ms = now;
+        boot_was_down = down;
+
+        if (down) {
+            last_activity_ms = now;
+            picker_active_ms = now;
+            if (display_asleep) {
+                screen::wake(kBrightnessPercent);
+                display_asleep = false;
+            } else if (!ui::pickerOpen()) {
+                ui::openPicker();
+                spotify::send(spotify::Command::RefreshDevices);
+            } else {
+                ui::nextPickerPage();
+            }
+        }
+    }
+}
 
 void handleTouch() {
     const touch::Contact &contact = touch::current();
@@ -43,21 +77,37 @@ void handleTouch() {
             return;
         }
         // Tracked every poll, so sliding off a button clears it and cancels.
-        if (!suppress_press) pressed_button = ui::hitTest(contact.x, contact.y);
+        if (suppress_press) return;
+        if (ui::pickerOpen()) {
+            picker_active_ms = millis();
+            picker_pressed = ui::pickerRowAt(device_list, contact.x, contact.y);
+        } else {
+            pressed_button = ui::hitTest(contact.x, contact.y);
+        }
         return;
     }
 
     // Fire on release, and only if the finger came up over the button it went
     // down on.
     if (!suppress_press) {
-        switch (pressed_button) {
-            case ui::Button::Previous:  spotify::send(spotify::Command::Previous); break;
-            case ui::Button::Next:      spotify::send(spotify::Command::Next); break;
-            case ui::Button::PlayPause: spotify::send(spotify::Command::TogglePlayback); break;
-            case ui::Button::None:      break;
+        if (ui::pickerOpen()) {
+            if (picker_pressed == ui::kPickerClose) {
+                ui::closePicker();
+            } else if (picker_pressed >= 0 && picker_pressed < device_list.count) {
+                spotify::selectDevice(device_list.items[picker_pressed].id);
+                ui::closePicker();
+            }
+        } else {
+            switch (pressed_button) {
+                case ui::Button::Previous:  spotify::send(spotify::Command::Previous); break;
+                case ui::Button::Next:      spotify::send(spotify::Command::Next); break;
+                case ui::Button::PlayPause: spotify::send(spotify::Command::TogglePlayback); break;
+                case ui::Button::None:      break;
+            }
         }
     }
     pressed_button = ui::Button::None;
+    picker_pressed = ui::kPickerNone;
     suppress_press = false;
 }
 
@@ -87,14 +137,20 @@ void setup() {
 
 void loop() {
     touch::poll();
+    handleBootButton();
     handleTouch();
 
     const uint32_t now = millis();
+
+    // An overlay left open forever would hide the thing the board is for.
+    if (ui::pickerOpen() && now - picker_active_ms > kPickerTimeoutMs) ui::closePicker();
 
     if (now - last_battery_ms >= kBatteryIntervalMs) {
         last_battery_ms = now;
         battery = hardware::readBattery();
     }
+
+    if (ui::pickerOpen()) last_activity_ms = now;  // never blank mid-selection
 
     // No PMIC here means no charge or VBUS sense, so "idle" is the only signal we
     // have. Blank the panel rather than sleeping the CPU: the Spotify task keeps
@@ -117,6 +173,11 @@ void loop() {
         return;
     }
 
-    ui::render(snapshot, battery, pressed_button);
+    if (ui::pickerOpen()) {
+        spotify::deviceSnapshot(device_list);
+        ui::renderPicker(device_list, picker_pressed);
+    } else {
+        ui::render(snapshot, battery, pressed_button);
+    }
     screen::endFrame();
 }

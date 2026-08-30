@@ -117,10 +117,36 @@ screen, so you never see the previous track's art against a new title.
 | "Sign-in expired" on screen | Refresh token rejected; re-run `tools/spotify_auth.py`. |
 | "Nothing playing" | No active Spotify session. Press play on the board — it wakes the last device it saw. |
 | "Nothing playing" and play does nothing | No controllable device is visible to Spotify at all. Open Spotify on a phone or speaker once so it registers, then try again. |
+| BOOT shows "No devices visible to Spotify" | Same cause — nothing is currently registered with your account. |
 | Taps land on the wrong button | Touch axis mapping. Add `-DTOUCH_FLIP_X` and/or `-DTOUCH_FLIP_Y`; `-DTOUCH_DEBUG` logs raw and mapped coordinates. |
 | Whole UI is upside down | `-DUI_ROTATION=3` (the other landscape orientation). |
 | Tearing or corrupt rows | Drop `kBusSpeedHz` in `Board.h` from 40 MHz to 32 MHz. |
 | No album art, "no art" tile | Check the log for the HTTP status; art failures retry once, then give up until the next track. |
+
+## Choosing which device to play on
+
+**Press the BOOT button** to open a full-screen list of every device Spotify can
+currently see. Tap one and playback moves there; that device also becomes the one
+the board wakes automatically from then on.
+
+- A **filled green dot** marks the device currently playing.
+- A **green ring** marks the device the board wakes by default.
+- Devices marked `not controllable` (`is_restricted`) are shown greyed out and
+  cannot be picked -- Spotify lists them but rejects Web API control.
+- With more than three devices, **press BOOT again** to page through; the header
+  shows `1/2` and so on.
+- The overlay closes on the X, on picking a device, or after 20 idle seconds.
+
+Selecting a device keeps playback in whatever state it was: playing carries on
+at the new device, and picking from an idle screen starts it there.
+
+The list is fetched live each time it opens rather than accumulated over time. A
+device Spotify cannot currently see cannot be transferred to either, so a
+remembered-but-absent entry would only be something to tap and have fail.
+
+Note that BOOT is GPIO0, the bootloader strap pin. Pressing it while the board is
+running is just a button; holding it down *while resetting* puts the board into
+firmware download mode.
 
 ## Waking an idle device
 

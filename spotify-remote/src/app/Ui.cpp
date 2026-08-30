@@ -287,3 +287,157 @@ void render(const NowPlaying &now, const hardware::Battery &battery, Button pres
 }
 
 }  // namespace ui
+
+// --- device picker --------------------------------------------------------
+
+namespace ui {
+namespace {
+
+constexpr int16_t kPickerHeaderBaseline = 22;
+constexpr int16_t kRowTop = 32;
+constexpr int16_t kRowHeight = 44;
+constexpr int16_t kRowPitch = 46;
+constexpr uint8_t kRowsPerPage = 3;
+constexpr int16_t kRowLeft = 8, kRowRight = 632;
+constexpr int16_t kCloseLeft = 596, kCloseRight = 632, kCloseTop = 2, kCloseBottom = 32;
+
+bool picker_open = false;
+uint8_t picker_page = 0;
+
+struct RenderedPicker {
+    bool valid = false;
+    uint32_t generation = 0;
+    uint8_t page = 0;
+    uint8_t count = 0;
+    bool loading = false;
+    int pressed = kPickerNone;
+    char preferred[64] = {};
+};
+RenderedPicker last_picker;
+
+int16_t rowTop(uint8_t slot) { return kRowTop + slot * kRowPitch; }
+
+void drawCloseIcon(uint16_t color) {
+    Arduino_GFX &g = screen::gfx();
+    const int16_t cx = (kCloseLeft + kCloseRight) / 2;
+    const int16_t cy = (kCloseTop + kCloseBottom) / 2;
+    for (int16_t d = 0; d < 2; ++d) {  // two passes for a 2 px stroke
+        g.drawLine(cx - 7 + d, cy - 7, cx + 7 + d, cy + 7, color);
+        g.drawLine(cx + 7 - d, cy - 7, cx - 7 - d, cy + 7, color);
+    }
+    screen::markDirty(kCloseLeft, kCloseTop, kCloseRight - kCloseLeft, kCloseBottom - kCloseTop);
+}
+
+void drawRow(const spotify::Device &device, uint8_t slot, bool pressed, bool preferred) {
+    const int16_t y = rowTop(slot);
+    const int16_t width = kRowRight - kRowLeft;
+
+    screen::fillRoundRect(kRowLeft, y, width, kRowHeight, 6, pressed ? kAccent : kArtPlacehold);
+
+    // A filled dot marks the device currently playing; a ring marks the one the
+    // board wakes by default.
+    Arduino_GFX &g = screen::gfx();
+    const int16_t dot_x = kRowLeft + 22, dot_y = y + kRowHeight / 2;
+    const uint16_t mark = pressed ? kBackground : kAccent;
+    if (device.active) {
+        g.fillCircle(dot_x, dot_y, 5, mark);
+    } else if (preferred) {
+        g.drawCircle(dot_x, dot_y, 5, mark);
+    }
+
+    const bool selectable = !device.restricted;
+    const uint16_t name_color = pressed      ? kBackground
+                                : selectable ? kPrimary
+                                             : kTertiary;
+    screen::drawText(&FontBody, kRowLeft + 38, y + 28, name_color, device.name, 400);
+
+    const char *detail = device.restricted ? "not controllable" : device.type;
+    screen::drawTextRight(&FontSmall, kRowRight - 16, y + 28,
+                          pressed ? kBackground : kTertiary, detail);
+}
+
+}  // namespace
+
+void openPicker() {
+    picker_open = true;
+    picker_page = 0;
+    last_picker = RenderedPicker{};
+}
+
+void closePicker() {
+    picker_open = false;
+    last = Rendered{};  // force a full repaint of the now-playing view
+}
+
+bool pickerOpen() { return picker_open; }
+
+void nextPickerPage() {
+    ++picker_page;
+    last_picker = RenderedPicker{};
+}
+
+int pickerRowAt(const spotify::DeviceList &list, int16_t x, int16_t y) {
+    if (x >= kCloseLeft && x <= kCloseRight && y >= kCloseTop && y <= kCloseBottom) {
+        return kPickerClose;
+    }
+    if (x < kRowLeft || x > kRowRight) return kPickerNone;
+
+    for (uint8_t slot = 0; slot < kRowsPerPage; ++slot) {
+        const int16_t top = rowTop(slot);
+        if (y < top || y > top + kRowHeight) continue;
+        const int index = picker_page * kRowsPerPage + slot;
+        if (index >= list.count) return kPickerNone;
+        if (list.items[index].restricted) return kPickerNone;  // cannot be selected
+        return index;
+    }
+    return kPickerNone;
+}
+
+void renderPicker(const spotify::DeviceList &list, int pressed_index) {
+    // Wrap the page here rather than in nextPickerPage(), which does not know
+    // how many devices there are.
+    const uint8_t pages = list.count == 0 ? 1 : (list.count + kRowsPerPage - 1) / kRowsPerPage;
+    if (picker_page >= pages) picker_page = 0;
+
+    const bool changed = !last_picker.valid || last_picker.generation != list.generation ||
+                         last_picker.page != picker_page || last_picker.count != list.count ||
+                         last_picker.loading != list.loading ||
+                         last_picker.pressed != pressed_index ||
+                         strcmp(last_picker.preferred, list.preferred_id) != 0;
+    if (!changed) return;
+
+    screen::fillRect(0, 0, screen::kWidth, screen::kHeight, kBackground);
+    screen::drawText(&FontBody, 16, kPickerHeaderBaseline, kSecondary, "Play on", 300);
+    if (pages > 1) {
+        char label[16];
+        snprintf(label, sizeof(label), "%u/%u", picker_page + 1, pages);
+        screen::drawTextRight(&FontSmall, kCloseLeft - 18, kPickerHeaderBaseline, kTertiary, label);
+    }
+    drawCloseIcon(pressed_index == kPickerClose ? kAccent : kSecondary);
+
+    if (list.count == 0) {
+        const char *message = list.loading ? "Looking for devices..."
+                                           : "No devices visible to Spotify";
+        screen::drawText(&FontBody, 16, rowTop(0) + 28, kTertiary, message, 600);
+        screen::drawText(&FontSmall, 16, rowTop(1) + 20, kTertiary,
+                         "Open Spotify on a phone, speaker or computer, then press BOOT again.",
+                         608);
+    } else {
+        for (uint8_t slot = 0; slot < kRowsPerPage; ++slot) {
+            const int index = picker_page * kRowsPerPage + slot;
+            if (index >= list.count) break;
+            drawRow(list.items[index], slot, pressed_index == index,
+                    strcmp(list.items[index].id, list.preferred_id) == 0);
+        }
+    }
+
+    last_picker.valid = true;
+    last_picker.generation = list.generation;
+    last_picker.page = picker_page;
+    last_picker.count = list.count;
+    last_picker.loading = list.loading;
+    last_picker.pressed = pressed_index;
+    strlcpy(last_picker.preferred, list.preferred_id, sizeof(last_picker.preferred));
+}
+
+}  // namespace ui
