@@ -1,6 +1,9 @@
 #include "Hardware.h"
 
 #include <Wire.h>
+#include <driver/gpio.h>
+#include <esp_sleep.h>
+
 #include <algorithm>
 
 #include "../drivers/Tca9554.h"
@@ -145,6 +148,47 @@ Battery readBattery() {
 }
 
 bool powerOff() { return setExpanderPin(expander::kSysEn, false); }
+
+void powerDown() {
+    // The real power-off. On battery the rails collapse and nothing below runs.
+    powerOff();
+    delay(150);
+
+    // Still here, so we are on USB. Emulate off with light sleep -- deep sleep
+    // would lose the PSRAM framebuffer and wake like a reboot.
+    const gpio_num_t wake_pin = static_cast<gpio_num_t>(buttons::kPowerPin);
+    pinMode(buttons::kPowerPin, INPUT_PULLUP);
+
+    // Sleeping while the button is still held wakes instantly, forever. This is
+    // the number-one cause of "sleep does nothing".
+    while (digitalRead(buttons::kPowerPin) == LOW) delay(10);
+    delay(60);  // let the contact settle
+
+    // A latched touch interrupt makes esp_light_sleep_start() a no-op.
+    clearTouchInterruptLatch();
+
+    gpio_wakeup_enable(wake_pin, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+    const esp_err_t slept = esp_light_sleep_start();
+
+    // Disarm on every exit path. A wake source left armed corrupts the next
+    // sleep's wake cause, which shows up as random spurious wakes.
+    gpio_wakeup_disable(wake_pin);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+
+    // Light sleep can be refused -- a driver holding a power-management lock is
+    // enough. Returning here would silently un-power-off the board, so idle
+    // dark instead and let the same button press bring it back.
+    if (slept != ESP_OK) {
+        log_w("light sleep rejected (%d); idling dark until PWR", slept);
+        while (digitalRead(buttons::kPowerPin) == HIGH) delay(50);
+    }
+
+    while (digitalRead(buttons::kPowerPin) == LOW) delay(10);  // release the wake press
+
+    // Re-latch, or the board dies the moment USB is unplugged later.
+    setExpanderPin(expander::kSysEn, true);
+}
 
 const char *revisionName() { return revision::kName; }
 

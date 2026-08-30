@@ -39,6 +39,14 @@ Battery readBattery();
 // board stays up regardless.
 bool powerOff();
 
+// The user-facing "turn it off". Clears SYS_EN, which on battery ends execution
+// here. If the board is still running afterwards it is on USB, where the latch
+// has no effect, so it light-sleeps until PWR is pressed again -- as close to
+// off as a board with no PMIC can get. Returns once it has been woken.
+//
+// The caller owns the display: blank it before calling, repaint after.
+void powerDown();
+
 // "rev1" / "rev2", for logging.
 const char *revisionName();
 

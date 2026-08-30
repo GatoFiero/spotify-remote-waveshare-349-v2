@@ -119,6 +119,7 @@ screen, so you never see the previous track's art against a new title.
 | "Nothing playing" and play does nothing | No controllable device is visible to Spotify at all. Open Spotify on a phone or speaker once so it registers, then try again. |
 | BOOT shows "No devices visible to Spotify" | Same cause — nothing is currently registered with your account. |
 | Taps land on the wrong button | Touch axis mapping. Add `-DTOUCH_FLIP_X` and/or `-DTOUCH_FLIP_Y`; `-DTOUCH_DEBUG` logs raw and mapped coordinates. |
+| PWR does nothing on USB | Expected: with no PMIC the latch cannot cut USB power, so it light-sleeps instead. Press PWR to wake. |
 | Whole UI is upside down | `-DUI_ROTATION=3` (the other landscape orientation). |
 | Tearing or corrupt rows | Drop `kBusSpeedHz` in `Board.h` from 40 MHz to 32 MHz. |
 | No album art, "no art" tile | Check the log for the HTTP status; art failures retry once, then give up until the next track. |
@@ -147,6 +148,29 @@ remembered-but-absent entry would only be something to tap and have fail.
 Note that BOOT is GPIO0, the bootloader strap pin. Pressing it while the board is
 running is just a button; holding it down *while resetting* puts the board into
 firmware download mode.
+
+## Turning it off
+
+**Hold the PWR button** for about a second. A "Powering off" screen fills as you
+hold; release early and it cancels. It is a hold rather than a tap so a brush
+against the button cannot kill the board mid-song.
+
+What actually happens depends on how the board is powered, and it cannot tell
+which — there is no PMIC, so no VBUS sense:
+
+- **On battery** it clears the SYS_EN latch and the board genuinely powers off.
+- **On USB** that latch has no effect, so execution simply continues past it.
+  The board then enters light sleep with PWR armed as the wake source, which is
+  as close to off as this hardware gets. Press PWR again to bring it back.
+
+One path covers both: clear the latch, wait, and if we are still executing we
+must be on USB. Light sleep rather than deep sleep, because deep sleep loses the
+PSRAM framebuffer and wakes like a reboot; this way waking is a repaint.
+
+SYS_EN is re-latched on wake, so the board still survives being unplugged from
+USB afterwards. If light sleep is ever refused — a driver holding a
+power-management lock is enough — it falls back to idling with the panel dark
+until PWR is pressed, rather than silently un-powering-off.
 
 ## Waking an idle device
 

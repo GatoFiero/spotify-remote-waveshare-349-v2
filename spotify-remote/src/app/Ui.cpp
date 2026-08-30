@@ -393,6 +393,32 @@ int pickerRowAt(const spotify::DeviceList &list, int16_t x, int16_t y) {
     return kPickerNone;
 }
 
+void invalidate() {
+    last = Rendered{};
+    last_picker = RenderedPicker{};
+}
+
+void drawPowerPrompt(uint8_t percent) {
+    constexpr int16_t kBarWidth = 220, kBarHeight = 6;
+    const int16_t bar_x = (screen::kWidth - kBarWidth) / 2;
+
+    screen::fillRect(0, 0, screen::kWidth, screen::kHeight, kBackground);
+
+    const char *title = "Powering off";
+    screen::drawText(&FontTitle, (screen::kWidth - screen::measure(&FontTitle, title)) / 2, 78,
+                     kPrimary, title, screen::kWidth);
+
+    const char *hint = "Release to cancel";
+    screen::drawText(&FontSmall, (screen::kWidth - screen::measure(&FontSmall, hint)) / 2, 102,
+                     kTertiary, hint, screen::kWidth);
+
+    screen::fillRoundRect(bar_x, 118, kBarWidth, kBarHeight, kBarHeight / 2, kTrack);
+    const int16_t filled = kBarWidth * percent / 100;
+    if (filled > 1) {
+        screen::fillRoundRect(bar_x, 118, filled, kBarHeight, kBarHeight / 2, kAccent);
+    }
+}
+
 void renderPicker(const spotify::DeviceList &list, int pressed_index) {
     // Wrap the page here rather than in nextPickerPage(), which does not know
     // how many devices there are.

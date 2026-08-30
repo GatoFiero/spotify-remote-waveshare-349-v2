@@ -22,6 +22,10 @@ constexpr uint32_t kIdleTimeoutMs = 120000;  // blank the panel after two idle m
 constexpr uint32_t kFrameIntervalMs = 33;    // ~30 fps ceiling; we redraw far less than that
 constexpr uint32_t kPickerTimeoutMs = 20000; // close the picker if it is left open
 constexpr uint32_t kBootDebounceMs = 40;
+// Held rather than tapped, so a brush against the button does not kill the
+// board mid-song. The prompt appears early enough to explain what is happening.
+constexpr uint32_t kPowerPromptMs = 200;
+constexpr uint32_t kPowerHoldMs = 900;
 
 ui::Button pressed_button = ui::Button::None;
 int picker_pressed = ui::kPickerNone;
@@ -29,6 +33,9 @@ spotify::DeviceList device_list;
 uint32_t picker_active_ms = 0;
 bool boot_was_down = false;
 uint32_t boot_changed_ms = 0;
+uint32_t power_hold_started_ms = 0;
+bool power_prompt_visible = false;
+int16_t power_prompt_percent = -1;
 bool suppress_press = false;  // set when a touch was consumed by waking the screen
 
 hardware::Battery battery;
@@ -37,6 +44,58 @@ uint32_t last_frame_ms = 0;
 uint32_t last_activity_ms = 0;
 bool display_asleep = false;
 bool last_seen_playing = false;
+
+// PWR held for kPowerHoldMs powers the board down. On battery that is a real
+// power-off; on USB it becomes a light sleep that the same button wakes.
+void handlePowerButton() {
+    const uint32_t now = millis();
+
+    if (!hardware::powerButtonPressed()) {
+        if (power_prompt_visible) {  // released early: put the screen back
+            ui::invalidate();
+            power_prompt_visible = false;
+            power_prompt_percent = -1;
+        }
+        power_hold_started_ms = 0;
+        return;
+    }
+
+    if (power_hold_started_ms == 0) power_hold_started_ms = now;
+    last_activity_ms = now;
+    const uint32_t held = now - power_hold_started_ms;
+
+    if (held >= kPowerHoldMs) {
+        log_i("power button held: shutting down");
+        screen::sleep();
+        hardware::powerDown();  // returns only on USB, once PWR is pressed again
+
+        // Repaint a correct frame before the backlight comes back, or the first
+        // thing the user sees is the shutdown screen again.
+        ui::invalidate();
+        power_prompt_visible = false;
+        power_prompt_percent = -1;
+        power_hold_started_ms = 0;
+        display_asleep = false;
+
+        app::NowPlaying resumed;
+        spotify::snapshot(resumed);
+        ui::render(resumed, battery, ui::Button::None);
+        screen::wake(kBrightnessPercent);
+        last_activity_ms = millis();
+        return;
+    }
+
+    if (held < kPowerPromptMs) return;
+
+    // Redraw only when the bar actually moves; this overlay is a full-screen
+    // repaint and does not need to run at frame rate.
+    const int16_t percent = held * 100 / kPowerHoldMs;
+    if (percent / 5 == power_prompt_percent / 5) return;
+    power_prompt_percent = percent;
+    power_prompt_visible = true;
+    ui::drawPowerPrompt(percent);
+    screen::endFrame();
+}
 
 // BOOT opens the device picker; pressing it again pages through the list when
 // there are more devices than fit on one screen.
@@ -137,8 +196,13 @@ void setup() {
 
 void loop() {
     touch::poll();
+    handlePowerButton();
     handleBootButton();
     handleTouch();
+
+    // While the shutdown prompt is up it owns the screen; rendering the normal
+    // view underneath would fight with it.
+    if (power_prompt_visible) return;
 
     const uint32_t now = millis();
 

@@ -36,4 +36,14 @@ int pickerRowAt(const spotify::DeviceList &list, int16_t x, int16_t y);
 
 void renderPicker(const spotify::DeviceList &list, int pressed_index);
 
+// --- power ----------------------------------------------------------------
+
+// Overlay shown while PWR is held, filling as the hold completes so the press
+// is both visible and cancellable.
+void drawPowerPrompt(uint8_t percent);
+
+// Discards the cached render state so the next render() or renderPicker()
+// repaints everything. Used after an overlay has covered the screen.
+void invalidate();
+
 }  // namespace ui
