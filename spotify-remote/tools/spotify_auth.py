@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""One-time Spotify authorisation for the ESP32 remote.
+
+Runs the Authorization Code + PKCE flow on this machine and prints (or writes)
+the refresh token the firmware needs. PKCE is used rather than the classic
+client-secret flow specifically so that no client secret ever has to live in
+the firmware image.
+
+Before running, create an app at https://developer.spotify.com/dashboard and add
+
+    http://127.0.0.1:8888/callback
+
+as a redirect URI. Spotify rejects "localhost"; it must be the literal IP.
+
+    python3 tools/spotify_auth.py --client-id <your client id>
+    python3 tools/spotify_auth.py --client-id <id> --write-secrets
+
+Note: with PKCE, Spotify hands back a *new* refresh token on most refreshes.
+The firmware stores the newest one in NVS and only falls back to the value
+baked into Secrets.h when NVS is empty, so you do not need to re-run this
+script routinely -- only if you revoke access or wipe NVS.
+"""
+
+import argparse
+import base64
+import getpass
+import hashlib
+import http.server
+import json
+import os
+import secrets
+import threading
+import urllib.parse
+import urllib.request
+import webbrowser
+
+REDIRECT_URI = "http://127.0.0.1:8888/callback"
+SCOPES = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+class CallbackHandler(http.server.BaseHTTPRequestHandler):
+    result = {}
+    done = threading.Event()
+
+    def do_GET(self):
+        query = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(query)
+        CallbackHandler.result = {k: v[0] for k, v in params.items()}
+
+        ok = "code" in CallbackHandler.result
+        body = (
+            "<h2>Authorised.</h2><p>You can close this tab and go back to the terminal.</p>"
+            if ok
+            else f"<h2>Authorisation failed.</h2><pre>{CallbackHandler.result}</pre>"
+        )
+        self.send_response(200 if ok else 400)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body.encode())
+        CallbackHandler.done.set()
+
+    def log_message(self, *args):
+        pass  # keep the console clean
+
+
+def post_token(payload: dict) -> dict:
+    request = urllib.request.Request(
+        "https://accounts.spotify.com/api/token",
+        data=urllib.parse.urlencode(payload).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as err:
+        raise SystemExit(f"Token request failed ({err.code}): {err.read().decode()}") from err
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client-id", required=True, help="Spotify app client ID")
+    parser.add_argument("--write-secrets", action="store_true",
+                        help="also prompt for WiFi and write src/Secrets.h")
+    args = parser.parse_args()
+
+    verifier = b64url(secrets.token_bytes(64))
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    state = b64url(secrets.token_bytes(16))
+
+    auth_url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode({
+        "client_id": args.client_id,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "code_challenge_method": "S256",
+        "code_challenge": challenge,
+        "state": state,
+        "scope": SCOPES,
+    })
+
+    server = http.server.HTTPServer(("127.0.0.1", 8888), CallbackHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    print("Opening your browser to authorise. If nothing happens, visit:\n")
+    print(auth_url + "\n")
+    webbrowser.open(auth_url)
+
+    if not CallbackHandler.done.wait(timeout=300):
+        raise SystemExit("Timed out waiting for the Spotify redirect.")
+    server.shutdown()
+
+    result = CallbackHandler.result
+    if "code" not in result:
+        raise SystemExit(f"Authorisation failed: {result}")
+    if result.get("state") != state:
+        raise SystemExit("State mismatch -- aborting rather than trusting this redirect.")
+
+    tokens = post_token({
+        "grant_type": "authorization_code",
+        "code": result["code"],
+        "redirect_uri": REDIRECT_URI,
+        "client_id": args.client_id,
+        "code_verifier": verifier,
+    })
+
+    refresh = tokens["refresh_token"]
+    print("\n" + "=" * 68)
+    print("Refresh token:\n\n  " + refresh)
+    print("=" * 68 + "\n")
+
+    if not args.write_secrets:
+        print("Paste it into src/Secrets.h, or re-run with --write-secrets.")
+        return
+
+    ssid = input("WiFi SSID (2.4 GHz -- the ESP32-S3 has no 5 GHz radio): ").strip()
+    password = getpass.getpass("WiFi password: ")
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "src", "Secrets.h")
+    with open(path, "w") as f:
+        f.write("// Generated by tools/spotify_auth.py -- git-ignored, do not commit.\n")
+        f.write("#pragma once\n\n")
+        f.write(f'#define WIFI_SSID              "{ssid}"\n')
+        f.write(f'#define WIFI_PASSWORD          "{password}"\n')
+        f.write(f'#define SPOTIFY_CLIENT_ID      "{args.client_id}"\n')
+        f.write(f'#define SPOTIFY_REFRESH_TOKEN  "{refresh}"\n')
+    os.chmod(path, 0o600)
+    print(f"\nWrote {path} (mode 600).")
+
+
+if __name__ == "__main__":
+    main()
