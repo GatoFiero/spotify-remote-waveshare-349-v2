@@ -1,6 +1,7 @@
 #include "Net.h"
 
 #include <WiFi.h>
+#include <time.h>
 
 #include "../Secrets.h"
 
@@ -35,9 +36,20 @@ bool ensureWifi() {
 
     if (WiFi.status() == WL_CONNECTED) {
         log_i("wifi up, ip %s, rssi %d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        // Validated TLS requires a real clock after a cold boot.
+        configTime(0, 0, "pool.ntp.org", "time.google.com");
+        const uint32_t clock_deadline = millis() + 15000;
+        while (time(nullptr) < 1700000000 && millis() < clock_deadline) delay(100);
+        if (time(nullptr) < 1700000000) {
+            log_w("waiting for clock synchronization before Spotify TLS");
+            WiFi.disconnect();
+            return false;
+        }
         return true;
     }
     log_w("wifi connect failed");
+    // Stop the in-flight retry before the next WiFi.begin reconfigures STA.
+    WiFi.disconnect();
     return false;
 }
 

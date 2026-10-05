@@ -149,6 +149,13 @@ Battery readBattery() {
 
 bool powerOff() { return setExpanderPin(expander::kSysEn, false); }
 
+void touchscreenPowerOff() {
+    powerOff();
+    delay(150);
+    // USB keeps the processor alive. Restore battery hold for the next unplug.
+    setExpanderPin(expander::kSysEn, true);
+}
+
 void powerDown() {
     // The real power-off. On battery the rails collapse and nothing below runs.
     powerOff();

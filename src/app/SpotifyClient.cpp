@@ -12,6 +12,12 @@
 #include "AlbumArt.h"
 #include "Net.h"
 #include "Text.h"
+#include "LikePolicy.h"
+#include "PlaylistPolicy.h"
+
+#ifndef SPOTIFY_AUTH_VERSION
+#define SPOTIFY_AUTH_VERSION "initial"
+#endif
 
 namespace spotify {
 namespace {
@@ -44,6 +50,8 @@ QueueHandle_t command_queue = nullptr;
 struct QueuedCommand {
     Command command;
     char device_id[64];
+    char track_uri[64] = {};
+    uint8_t value = 0;
 };
 
 Preferences prefs;
@@ -88,6 +96,13 @@ void setStatus(Status status) {
 
 void loadRefreshToken() {
     prefs.begin("spotify", /*readOnly=*/false);
+    // A deliberate browser sign-in supersedes an older rotated token, while
+    // ordinary firmware updates preserve the device's latest rotated token.
+    if (prefs.getString("authver", "") != SPOTIFY_AUTH_VERSION) {
+        prefs.putString("refresh", SPOTIFY_REFRESH_TOKEN);
+        prefs.putString("authver", SPOTIFY_AUTH_VERSION);
+        log_i("imported updated Spotify authorization");
+    }
     refresh_token = prefs.getString("refresh", "");
     last_device_id = prefs.getString("device", "");
     last_device_name = prefs.getString("devname", "");
@@ -187,14 +202,20 @@ bool ensureAccessToken() {
 // the parsed document in the hundreds of bytes instead of over 100 KB.
 void buildFilter(JsonDocument &filter) {
     filter["is_playing"] = true;
+    filter["shuffle_state"] = true;
+    filter["repeat_state"] = true;
     filter["progress_ms"] = true;
     filter["device"]["id"] = true;
     filter["device"]["name"] = true;
+    filter["device"]["volume_percent"] = true;
+    filter["device"]["supports_volume"] = true;
+    filter["device"]["is_restricted"] = true;
 
     JsonObject item = filter["item"].to<JsonObject>();
     item["name"] = true;
     item["duration_ms"] = true;
     item["type"] = true;
+    item["uri"] = true;
     item["artists"][0]["name"] = true;
 
     JsonObject album = item["album"].to<JsonObject>();
@@ -231,7 +252,12 @@ void applyStopped(Status status) {
     state.status = status;
     state.has_track = false;
     state.is_playing = false;
+    state.device_id[0] = '\0';
+    state.volume_percent = -1;
+    state.supports_volume = false;
     state.title[0] = state.artist[0] = state.album[0] = '\0';
+    state.track_uri[0] = '\0';
+    state.like_state = app::LikeState::Ready;
     // Keep the device name: the UI uses it to offer to wake that device.
     strlcpy(state.device_name, last_device_name.c_str(), sizeof(state.device_name));
     xSemaphoreGive(state_mutex);
@@ -321,12 +347,23 @@ bool pollPlayerState() {
                                 : item["album"]["images"].as<JsonArrayConst>());
 
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    const bool track_changed = strcmp(state.title, title) != 0 ||
+    const char *track_uri = is_episode ? "" : (item["uri"] | "");
+    if (!isSaveableTrack(track_uri)) track_uri = "";
+    const bool track_changed = strcmp(state.track_uri, track_uri) != 0 || strcmp(state.title, title) != 0 ||
                                strcmp(state.artist, artist) != 0 ||
                                strcmp(state.album, album) != 0;
     state.status = Status::Playing;
     state.has_track = true;
+    strlcpy(state.track_uri, track_uri, sizeof(state.track_uri));
+    if (track_changed) state.like_state = app::LikeState::Ready;
     state.is_playing = doc["is_playing"] | false;
+    state.shuffle = doc["shuffle_state"] | false;
+    const char *repeat = doc["repeat_state"] | "off";
+    state.repeat_mode = strcmp(repeat,"track") == 0 ? 2 : strcmp(repeat,"context") == 0 ? 1 : 0;
+    state.volume_percent = doc["device"]["volume_percent"] | -1;
+    state.supports_volume = doc["device"]["supports_volume"] | false;
+    state.device_restricted = doc["device"]["is_restricted"] | false;
+    strlcpy(state.device_id, doc["device"]["id"] | "", sizeof(state.device_id));
     strlcpy(state.title, title, sizeof(state.title));
     strlcpy(state.artist, artist, sizeof(state.artist));
     strlcpy(state.album, album, sizeof(state.album));
@@ -512,8 +549,116 @@ bool wakeDevice(bool start_playing) {
 // --- transport ------------------------------------------------------------
 
 bool runCommand(const QueuedCommand &queued) {
-    if (!ensureAccessToken()) return false;
+    if (!ensureAccessToken()) {
+        if (queued.command == Command::LikeTrack) {
+            xSemaphoreTake(state_mutex, portMAX_DELAY);
+            if (strcmp(state.track_uri, queued.track_uri) == 0) state.like_state = app::LikeState::Failed;
+            xSemaphoreGive(state_mutex);
+        }
+        if (queued.command == Command::SetVolume || queued.command == Command::SetShuffle || queued.command == Command::SetRepeat || queued.command == Command::PlayPlaylist) {
+            xSemaphoreTake(state_mutex, portMAX_DELAY);
+            state.control_pending = false;
+            state.control_result = -1;
+            xSemaphoreGive(state_mutex);
+        }
+        return false;
+    }
     const Command command = queued.command;
+    if (command == Command::PlayPlaylist) {
+        auto request = [&](const String &url, const String &body) {
+            HTTPClient http;
+            http.setTimeout(10000);
+            http.setReuse(true);
+            int code = -1;
+            if (http.begin(api_client,url)) {
+                http.addHeader("Authorization","Bearer " + access_token);
+                if (body.isEmpty()) http.addHeader("Content-Length","0");
+                else http.addHeader("Content-Type","application/json");
+                code = http.PUT(body);
+                const String response = hasBody(http,code) ? http.getString() : String();
+                if (code < 200 || code >= 300) log_w("playlist request HTTP %d: %s",code,response.c_str());
+                http.end();
+            }
+            if (code == HTTP_CODE_UNAUTHORIZED) access_token = "";
+            return code;
+        };
+        const String suffix = String("&device_id=") + queued.device_id;
+        const String shuffle_url = String(kApiBase) + "shuffle?state=true" + suffix;
+        int code = request(shuffle_url,"");
+        if (code >= 200 && code < 300) {
+            const String body = String("{\"context_uri\":\"") + queued.track_uri + "\"}";
+            code = request(String(kApiBase) + "play?device_id=" + queued.device_id,body);
+            // Reassert shuffle after changing context, since clients can change
+            // it when loading another playlist. Do not claim success on failure.
+            if (code >= 200 && code < 300) code = request(shuffle_url,"");
+        }
+        const bool ok = code >= 200 && code < 300;
+        xSemaphoreTake(state_mutex,portMAX_DELAY);
+        state.control_pending = false;
+        state.control_result = code;
+        if (ok && strcmp(state.device_id,queued.device_id) == 0) state.shuffle = true;
+        xSemaphoreGive(state_mutex);
+        log_i("playlist launch with shuffle HTTP %d: %s",code,ok ? "confirmed" : "failed");
+        return ok;
+    }
+    if (command == Command::SetVolume || command == Command::SetShuffle || command == Command::SetRepeat) {
+        String url = kApiBase;
+        if (command == Command::SetVolume) url += "volume?volume_percent=" + String(queued.value);
+        else if (command == Command::SetShuffle) url += String("shuffle?state=") + (queued.value ? "true" : "false");
+        else url += String("repeat?state=") + (queued.value == 2 ? "track" : queued.value == 1 ? "context" : "off");
+        url += "&device_id=";
+        url += queued.device_id;
+        HTTPClient http;
+        http.setTimeout(10000);
+        http.setReuse(true);
+        int code = -1;
+        String response;
+        if (http.begin(api_client,url)) {
+            http.addHeader("Authorization","Bearer " + access_token);
+            http.addHeader("Content-Length","0");
+            code = http.PUT("");
+            if (hasBody(http,code)) response = http.getString();
+            http.end();
+        }
+        if (code == HTTP_CODE_UNAUTHORIZED) access_token = "";
+        const bool ok = code >= 200 && code < 300;
+        xSemaphoreTake(state_mutex,portMAX_DELAY);
+        state.control_pending = false;
+        state.control_result = code;
+        if (ok && strcmp(state.device_id,queued.device_id) == 0) {
+            if (command == Command::SetVolume) state.volume_percent = queued.value;
+            else if (command == Command::SetShuffle) state.shuffle = queued.value;
+            else state.repeat_mode = queued.value;
+        }
+        xSemaphoreGive(state_mutex);
+        log_i("music control %u HTTP %d: %s",static_cast<unsigned>(command),code,ok ? "confirmed" : response.c_str());
+        return ok;
+    }
+    if (command == Command::LikeTrack) {
+        const std::string url = saveTrackUrl(queued.track_uri);
+        if (url.empty()) return false;
+        HTTPClient http;
+        http.setTimeout(10000);
+        http.setReuse(true);
+        int code = -1;
+        String response;
+        if (http.begin(api_client, url.c_str())) {
+            http.addHeader("Authorization", "Bearer " + access_token);
+            http.addHeader("Content-Length", "0");
+            code = http.PUT("");
+            if (hasBody(http, code)) response = http.getString();
+            http.end();
+        }
+        if (code == HTTP_CODE_UNAUTHORIZED) access_token = "";
+        const app::LikeState result = saveConfirmed(code) ? app::LikeState::Saved
+            : code == HTTP_CODE_FORBIDDEN ? app::LikeState::NeedsAuthorization : app::LikeState::Failed;
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        if (strcmp(state.track_uri, queued.track_uri) == 0) state.like_state = result;
+        xSemaphoreGive(state_mutex);
+        log_i("save to Liked Songs HTTP %d: %s", code, saveConfirmed(code) ? "confirmed" : "not saved");
+        if (!saveConfirmed(code)) log_w("library save error: %s", response.c_str());
+        return saveConfirmed(code);
+    }
 
     if (command == Command::RefreshDevices) return fetchDevices();
 
@@ -582,6 +727,8 @@ bool runCommand(const QueuedCommand &queued) {
         return false;
     }
 
+    log_i("transport command %u HTTP %d confirmed", static_cast<unsigned>(command), code);
+
     // Reflect the toggle immediately so the button feels instant; the next poll
     // corrects it if Spotify disagreed.
     if (command == Command::TogglePlayback) {
@@ -600,7 +747,7 @@ void task(void *) {
     loadRefreshToken();
     if (refresh_token.startsWith("paste-the-") || refresh_token.isEmpty()) {
         log_e("no refresh token: run tools/spotify_auth.py and fill in src/Secrets.h");
-        setStatus(Status::AuthFailed);
+        setStatus(Status::SetupRequired);
         vTaskDelete(nullptr);
     }
     uint32_t next_poll_ms = 0;
@@ -688,6 +835,67 @@ bool selectDevice(const char *device_id) {
     QueuedCommand queued{Command::SelectDevice, {}};
     strlcpy(queued.device_id, device_id, sizeof(queued.device_id));
     return xQueueSend(command_queue, &queued, 0) == pdTRUE;
+}
+
+bool likeTrack(const char *track_uri) {
+    if (!command_queue || !isSaveableTrack(track_uri)) return false;
+    QueuedCommand queued{Command::LikeTrack, {}};
+    strlcpy(queued.track_uri, track_uri, sizeof(queued.track_uri));
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    const bool current = strcmp(state.track_uri, track_uri) == 0;
+    if (!current || state.like_state == app::LikeState::Saving || state.like_state == app::LikeState::Saved) {
+        xSemaphoreGive(state_mutex);
+        return false;
+    }
+    const bool accepted = xQueueSend(command_queue, &queued, 0) == pdTRUE;
+    if (accepted) state.like_state = app::LikeState::Saving;
+    xSemaphoreGive(state_mutex);
+    return accepted;
+}
+
+bool queueMusicControl(Command command, int8_t delta = 0) {
+    if (!command_queue) return false;
+    xSemaphoreTake(state_mutex,portMAX_DELAY);
+    if (state.control_pending) { xSemaphoreGive(state_mutex); return false; }
+    state.control_kind = static_cast<uint8_t>(command);
+    if (state.status != Status::Playing || !state.device_id[0] || state.device_restricted ||
+        (command == Command::SetVolume && (!state.supports_volume || state.volume_percent < 0))) {
+        state.control_result = 403;
+        xSemaphoreGive(state_mutex);
+        return false;
+    }
+    QueuedCommand queued{command,{}};
+    strlcpy(queued.device_id,state.device_id,sizeof(queued.device_id));
+    if (command == Command::SetVolume) queued.value = constrain(state.volume_percent + delta,0,100);
+    else if (command == Command::SetShuffle) queued.value = !state.shuffle;
+    else queued.value = (state.repeat_mode + 1) % 3;
+    const bool accepted = xQueueSend(command_queue,&queued,0) == pdTRUE;
+    state.control_pending = accepted;
+    state.control_result = accepted ? 0 : -1;
+    xSemaphoreGive(state_mutex);
+    return accepted;
+}
+bool adjustVolume(int8_t delta) { return queueMusicControl(Command::SetVolume,delta); }
+bool toggleShuffle() { return queueMusicControl(Command::SetShuffle); }
+bool cycleRepeat() { return queueMusicControl(Command::SetRepeat); }
+bool playPlaylist(const char *playlist_uri) {
+    if (!command_queue || !isPlaylistUri(playlist_uri)) return false;
+    xSemaphoreTake(state_mutex,portMAX_DELAY);
+    if (state.control_pending) { xSemaphoreGive(state_mutex); return false; }
+    state.control_kind = static_cast<uint8_t>(Command::PlayPlaylist);
+    if (!state.device_id[0] || state.device_restricted || state.status != Status::Playing) {
+        state.control_result = 404;
+        xSemaphoreGive(state_mutex);
+        return false;
+    }
+    QueuedCommand queued{Command::PlayPlaylist,{}};
+    strlcpy(queued.device_id,state.device_id,sizeof(queued.device_id));
+    strlcpy(queued.track_uri,playlist_uri,sizeof(queued.track_uri));
+    const bool accepted = xQueueSend(command_queue,&queued,0) == pdTRUE;
+    state.control_pending = accepted;
+    state.control_result = accepted ? 0 : -1;
+    xSemaphoreGive(state_mutex);
+    return accepted;
 }
 
 }  // namespace spotify

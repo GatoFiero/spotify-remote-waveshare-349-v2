@@ -1,199 +1,103 @@
-# Spotify remote — Waveshare ESP32-S3-Touch-LCD-3.49
+# Spotify Remote Plus — Waveshare 3.49 V2
 
-A now-playing display and transport remote on the 640 × 172 touch panel. Shows the
-current track, artist, album, album art and progress; the three touch buttons do
-previous / play-pause / next against whatever device your Spotify account is
-currently playing on.
+A touchscreen Spotify remote for the **Waveshare ESP32-S3-Touch-LCD-3.49 V2**, with a 640 × 172 display, album artwork, gesture menus, Liked Songs saving, and playlist shortcuts.
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ ┌────────┐  Bohemian Rhapsody - Rem…                             │
-│ │        │  Queen                              ⏮   ▶   ⏭        │
-│ │  art   │  A Night at the Opera                                 │
-│ │        │  ━━━━━━━━━━──────────────                             │
-│ └────────┘  2:14                5:55                        78%  │
-└──────────────────────────────────────────────────────────────────┘
-```
+Built on [FaridZandi/eps32-spotify-controller](https://github.com/FaridZandi/eps32-spotify-controller). The upstream history and author attribution are retained. This upgrade was developed and flashed on the V2 board; the inherited V1 build configuration has not been tested with these additions.
 
-## Why WiFi and not Bluetooth
+**This is a remote:** music plays on your existing phone, computer, or Spotify Connect speaker. The onboard speaker is not a Spotify playback device in this firmware.
 
-The ESP32-S3 has no Bluetooth Classic radio — BLE only. Track metadata over
-Bluetooth comes from AVRCP, which is a Classic profile, so a BLE build could send
-media-key presses but could never know what is playing. Everything here goes over
-WiFi to the Spotify Web API instead, which covers both directions.
+## Controls
 
-Consequence: the board needs a **2.4 GHz** network (there is no 5 GHz radio) and
-an internet connection. Control is account-wide, not phone-local — it drives
-whichever device is active, which also means it works when your phone is in
-another room.
+| Action | Result |
+|---|---|
+| Main screen | Artwork, title, artist, album, progress, previous / play-pause / next, and a heart |
+| Swipe down from the top left | Volume −/+ in 5% steps, shuffle, and repeat Off / All / One song |
+| Swipe down from the top right | Choose playback device, brightness, and shutdown |
+| Swipe up from the bottom | Eight playlist shortcuts in two columns, plus a ninth full-width shortcut at the bottom |
+| Large X | Close a menu |
+| Short PWR press or BOOT | Open the Spotify device picker |
+| Hold PWR | Power off on battery; sleep on USB |
+| RESET | Restart the board |
 
-## Setup
+Begin a swipe near the screen edge, move about a quarter of the screen height, and release before tapping. Taps keep their initial target through small finger movement; dragging farther cancels the tap. Opening a menu cannot also trigger one of its options.
 
-**1. Create a Spotify app.** At <https://developer.spotify.com/dashboard>, create
-an app and add exactly this redirect URI:
+The heart saves the displayed track to Liked Songs. White means ready, yellow means saving, green means Spotify accepted the save, and red means it failed. It does not remove songs or query whether a song was already liked. Episodes and local files are excluded.
 
-```
-http://127.0.0.1:8888/callback
-```
+Playlist shortcuts start a Spotify playlist context on the current playback device and request shuffle before and after loading it. Device selection, playlist launch, and music controls depend on Spotify and the target device accepting the request. Errors are shown instead of a false success state.
 
-Spotify rejects `localhost`; it has to be the literal loopback IP. Note the
-client ID. There is no client secret to copy — this uses the PKCE flow precisely
-so that no secret has to live in the firmware.
+Brightness changes in 10% steps and persists across restarts. Touchscreen shutdown powers off on battery. USB keeps the processor powered, so touchscreen shutdown blanks the display; a tap wakes it, and Spotify continues running during this USB standby. The physical PWR hold uses the inherited USB sleep behavior.
 
-**2. Authorise once, on this machine.**
+## Requirements
 
-```bash
-python3 tools/spotify_auth.py --client-id <your client id> --write-secrets
-```
+- Waveshare ESP32-S3-Touch-LCD-3.49 **V2**, a USB data cable, and 2.4 GHz Wi-Fi with internet access.
+- Spotify Premium for playback-control APIs and a Spotify developer app you can authorize.
+- Python 3.10 or newer, Git, and the tools in `requirements.txt`.
+- An available Spotify playback device. Open Spotify on it before testing the remote.
 
-It opens your browser, you approve, and it writes `src/Secrets.h` with your WiFi
-credentials and the refresh token. `src/Secrets.h` is git-ignored. Without
-`--write-secrets` it just prints the token for you to paste in yourself.
+## Set up Spotify and Wi-Fi
 
-**3. Build and flash.** Pick the environment matching your board revision —
-getting this wrong gives you a board that boots, mounts everything, logs no
-errors, and shows a black screen:
+1. In the [Spotify developer dashboard](https://developer.spotify.com/dashboard), create an app and select **Web API**. Register exactly `http://127.0.0.1:8888/callback` as its redirect URI. No client secret is needed.
+2. Clone this repository and install the tools:
 
-```bash
-pio run -e rev2 -t upload && pio device monitor   # ESP32-S3-Touch-LCD-3.49B
-pio run -e rev1 -t upload && pio device monitor   # original 3.49
-```
+   ```sh
+   git clone https://github.com/GatoFiero/spotify-remote-waveshare-349-v2.git
+   cd spotify-remote-waveshare-349-v2
+   python -m pip install -r requirements.txt
+   python tools/local_setup.py
+   ```
 
-## Layout of the source
+3. Open [the local setup page](http://127.0.0.1:8888/) on the same computer. Enter your app Client ID and Wi-Fi details, then approve Spotify authorization. The server binds only to loopback, uses PKCE and form protection, and writes `src/Secrets.h` locally.
+4. Connect the board, build, and upload:
 
-```
-src/platform/    pins, rails, reset order, bus choice. Board.h is the only file
-                 with GPIO numbers in it; rev1/ and rev2/ differ by three lines.
-src/drivers/     TCA9554 expander, AXS15231B touch. Chip facts, no board facts.
-src/app/         Spotify client, album art, UI. Never sees a GPIO number.
-src/fonts/       generated — see tools/gen_font.py
+   ```sh
+   python -m platformio run -e rev2
+   python -m platformio device list
+   python -m platformio run -e rev2 -t upload --upload-port YOUR_SERIAL_PORT
+   ```
+
+   Replace `YOUR_SERIAL_PORT` with the board's port, such as `COM6` on Windows or `/dev/ttyACM0` on Linux. Close serial monitors before uploading.
+
+On Windows, after installing the requirements, `powershell -ExecutionPolicy Bypass -File tools/setup-windows.ps1 -Port COM6` performs setup, build, upload, and boot diagnostics. Replace the port for your computer. The script also accepts `-Python` and `-SkipBootCheck`.
+
+For command-line authorization instead of the browser form:
+
+```sh
+python tools/spotify_auth.py --client-id YOUR_CLIENT_ID --write-secrets
 ```
 
-Two tasks: **core 0** runs everything network (WiFi, TLS, JSON, album art
-download and decode), **core 1** runs the UI loop. A 500 ms HTTPS round trip
-therefore never stalls touch or drawing.
+Credentials are saved locally and are not printed. Each deliberate authorization gets a version marker so the firmware imports the new refresh token; normal reflashing retains the token rotated by Spotify in NVS.
 
-## Things worth knowing
+Use `/wifi` on the local setup server to update Wi-Fi while retaining authorization, or `/reauthorize` to approve the current Liked Songs scope. Rebuild and upload after changing local credentials.
 
-**Refresh tokens rotate.** Under PKCE, Spotify usually issues a new refresh token
-on every refresh. The firmware writes the newest one to NVS and only falls back
-to the value in `Secrets.h` when NVS is empty — so re-flashing is fine, and you
-only need to re-run the auth tool if you revoke access or erase NVS.
+## Customize playlists
 
-**TLS is properly validated.** The ESP-IDF root certificate bundle is already
-compiled into the Arduino libs; `net::secure()` attaches it. There is no
-`setInsecure()` anywhere.
+Edit `src/app/PlaylistShortcuts.h`. Each entry has a label and a `spotify:playlist:...` URI. For a share link such as `https://open.spotify.com/playlist/PLAYLIST_ID?si=...`, use `spotify:playlist:PLAYLIST_ID`; discard the query string.
 
-**Poll rate.** State is fetched every 3 s and the progress bar is interpolated
-locally in between, so the bar moves smoothly on one request per 3 s. After a
-button press it re-polls after 600 ms, since Spotify takes a moment to settle.
+The supplied nine shortcuts are examples of the setup used during development. Personalized playlists may depend on account access. Slots 1–8 occupy the two columns; slot 9 spans both columns at the bottom. The current layout supports up to nine shortcuts.
 
-**The screen blanks after two idle minutes,** but only when nothing is playing —
-see `kIdleTimeoutMs` in `main.cpp`. It blanks the panel rather than sleeping the
-CPU, so polling continues and waking is a repaint from the retained framebuffer,
-not a re-render.
+## Validation and limitations
 
-**Fonts are generated, not vendored.** `tools/gen_font.py` rasterises a TTF into
-an Adafruit-GFX `GFXfont` header. The committed ones come from DejaVu Sans
-(permissively licensed, shipped with matplotlib). To change the type:
+Native C++ checks cover touch-target separation, swipe recognition, tap drift and drag cancellation, and track/playlist URI validation:
 
-```bash
-python3 tools/gen_font.py /path/to/Font.ttf 22 FontTitle src/fonts/FontTitle.h
+```sh
+python tools/run_native_tests.py
 ```
 
-They cover Latin-1, which handles most accented artist names. Anything outside it
-(CJK, emoji) folds to `?` — `src/app/Text.cpp` maps the typographic punctuation
-Spotify metadata is full of onto ASCII first.
+This command needs `g++` on PATH. CI runs the same checks and builds V2 using **placeholder credentials**. The configured firmware has been flashed and observed receiving real Spotify metadata, accepting volume changes, and launching playlists with shuffle. Read [the validation notes](docs/VALIDATION.md) for the boundary between build checks, API acceptance, and physical confirmation.
 
-**Album art** is fetched at 300 × 300 and decoded at half scale to exactly 150 ×
-150 into PSRAM. A cover is only drawn when its generation matches the track on
-screen, so you never see the previous track's art against a new title.
+The project is a working hardware prototype. The playlist tap/layout fix has been confirmed readable and clickable on the V2 board; battery shutdown, long-term reconnect behavior, and every Spotify/device combination are not fully qualified. Build success alone does not prove touchscreen usability or audible playback.
 
-## If something is wrong
+## Protect your credentials
 
-| Symptom | Cause |
-| --- | --- |
-| Black screen, no errors in the log | Wrong revision environment. Try the other one. |
-| "Sign-in expired" on screen | Refresh token rejected; re-run `tools/spotify_auth.py`. |
-| "Nothing playing" | No active Spotify session. Press play on the board — it wakes the last device it saw. |
-| "Nothing playing" and play does nothing | No controllable device is visible to Spotify at all. Open Spotify on a phone or speaker once so it registers, then try again. |
-| BOOT shows "No devices visible to Spotify" | Same cause — nothing is currently registered with your account. |
-| Taps land on the wrong button | Touch axis mapping. Add `-DTOUCH_FLIP_X` and/or `-DTOUCH_FLIP_Y`; `-DTOUCH_DEBUG` logs raw and mapped coordinates. |
-| PWR does nothing on USB | Expected: with no PMIC the latch cannot cut USB power, so it light-sleeps instead. Press PWR to wake. |
-| Whole UI is upside down | `-DUI_ROTATION=3` (the other landscape orientation). |
-| Tearing or corrupt rows | Drop `kBusSpeedHz` in `Board.h` from 40 MHz to 32 MHz. |
-| No album art, "no art" tile | Check the log for the HTTP status; art failures retry once, then give up until the next track. |
+`src/Secrets.h`, local setup state, serial logs, device backups, and generated firmware files are excluded from Git. **Do not upload configured firmware binaries:** they contain Wi-Fi and Spotify credentials. Only source and the placeholder example are published here. Back up an existing device before replacing its firmware; never restore another person's flash backup onto your board.
 
-## Choosing which device to play on
+## Source and next improvements
 
-**Press the BOOT button** to open a full-screen list of every device Spotify can
-currently see. Tap one and playback moves there; that device also becomes the one
-the board wakes automatically from then on.
+- `src/platform/`: display, touch, power, and board wiring.
+- `src/app/`: Spotify requests, artwork, UI, gestures, and playlist configuration.
+- `tools/`: local authorization, setup, diagnostics, and native checks.
+- `tests/`: native input and request-policy checks.
 
-- A **filled green dot** marks the device currently playing.
-- A **green ring** marks the device the board wakes by default.
-- Devices marked `not controllable` (`is_restricted`) are shown greyed out and
-  cannot be picked -- Spotify lists them but rejects Web API control.
-- With more than three devices, **press BOOT again** to page through; the header
-  shows `1/2` and so on.
-- The overlay closes on the X, on picking a device, or after 20 idle seconds.
+See [the roadmap](docs/ROADMAP.md) for playlist editing without rebuilding, clearer request feedback, seeking, a sleep timer, and recovery improvements. Speaker streaming is a separate experiment, not an implemented feature.
 
-Selecting a device keeps playback in whatever state it was: playing carries on
-at the new device, and picking from an idle screen starts it there.
-
-The list is fetched live each time it opens rather than accumulated over time. A
-device Spotify cannot currently see cannot be transferred to either, so a
-remembered-but-absent entry would only be something to tap and have fail.
-
-Note that BOOT is GPIO0, the bootloader strap pin. Pressing it while the board is
-running is just a button; holding it down *while resetting* puts the board into
-firmware download mode.
-
-## Turning it off
-
-**Hold the PWR button** for about a second. A "Powering off" screen fills as you
-hold; release early and it cancels. It is a hold rather than a tap so a brush
-against the button cannot kill the board mid-song.
-
-What actually happens depends on how the board is powered, and it cannot tell
-which — there is no PMIC, so no VBUS sense:
-
-- **On battery** it clears the SYS_EN latch and the board genuinely powers off.
-- **On USB** that latch has no effect, so execution simply continues past it.
-  The board then enters light sleep with PWR armed as the wake source, which is
-  as close to off as this hardware gets. Press PWR again to bring it back.
-
-One path covers both: clear the latch, wait, and if we are still executing we
-must be on USB. Light sleep rather than deep sleep, because deep sleep loses the
-PSRAM framebuffer and wakes like a reboot; this way waking is a repaint.
-
-SYS_EN is re-latched on wake, so the board still survives being unplugged from
-USB afterwards. If light sleep is ever refused — a driver holding a
-power-management lock is enough — it falls back to idling with the panel dark
-until PWR is pressed, rather than silently un-powering-off.
-
-## Waking an idle device
-
-Spotify drops a paused session after a while and stops reporting any active
-device, which normally leaves a remote with nothing to command. The board keeps
-the id and name of the last device it saw playing — in NVS, so it survives a
-power cycle — and when you press a button with no live session it first sends
-`PUT /me/player` to move playback back to that device, then sends the command.
-Pressing play needs nothing further, since transferring with `play: true` is
-itself the play action.
-
-If the remembered device has gone (phone off, speaker unplugged), it falls back
-to `GET /me/player/devices` and picks the best controllable one: an already
-active device first, then one matching the remembered name, then anything that
-is not `is_restricted`. Restricted devices appear in the list but reject Web API
-control, so they are never chosen.
-
-The idle screen names what it will wake — "Tap play to resume on Kitchen" —
-rather than just saying nothing is playing.
-
-## Possible extensions
-
-Volume and shuffle/repeat are two more Web API endpoints (`/volume`,
-`/shuffle`, `/repeat`) and would fit naturally as a second page reached by a
-swipe. Seeking by tapping the progress bar is `PUT /me/player/seek` plus a hit
-test on the bar rectangle.
+See [NOTICE.md](NOTICE.md) for upstream provenance and license status. This project is not affiliated with Spotify or Waveshare.

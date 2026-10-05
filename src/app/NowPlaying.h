@@ -4,9 +4,11 @@
 #include <stdint.h>
 
 namespace app {
+enum class LikeState : uint8_t { Ready, Saving, Saved, NeedsAuthorization, Failed };
 
 enum class Status : uint8_t {
     Booting,
+    SetupRequired, // Complete the local browser setup before connecting.
     WifiConnecting,
     Authorizing,
     Playing,        // talking to Spotify successfully (playing or paused)
@@ -19,10 +21,21 @@ struct NowPlaying {
     Status status = Status::Booting;
     bool has_track = false;
     bool is_playing = false;
+    bool shuffle = false;
+    uint8_t repeat_mode = 0; // off, context, track
+    int16_t volume_percent = -1;
+    bool supports_volume = false;
+    bool device_restricted = false;
+    char device_id[64] = {};
+    bool control_pending = false;
+    int16_t control_result = 0; // last command HTTP status; 0 means none yet
+    uint8_t control_kind = 0;
 
     char title[128] = {};
     char artist[128] = {};
     char album[128] = {};
+    char track_uri[64] = {}; // Empty for episodes and local files.
+    LikeState like_state = LikeState::Ready;
 
     // The device playing, or the last one seen if playback has since gone idle.
     char device_name[64] = {};

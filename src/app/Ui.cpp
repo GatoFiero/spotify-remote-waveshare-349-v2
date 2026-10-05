@@ -8,6 +8,8 @@
 #include "../platform/Screen.h"
 #include "AlbumArt.h"
 #include "Text.h"
+#include "PlaylistShortcuts.h"
+#include "PlaylistLayout.h"
 
 namespace ui {
 namespace {
@@ -44,8 +46,6 @@ constexpr int16_t kMetaTop = 20, kMetaHeight = 86;
 
 constexpr int16_t kButtonCenterY = 76;
 constexpr int16_t kButtonRadius = 23;   // drawn chip
-constexpr int16_t kHitHalfWidth = 26;   // touch target, deliberately larger
-constexpr int16_t kHitTop = 24, kHitBottom = 128;
 constexpr int16_t kPrevCx = 512, kPlayCx = 560, kNextCx = 608;
 
 constexpr int16_t kStatusRight = 628, kStatusBaseline = 156;
@@ -56,6 +56,8 @@ struct Rendered {
     char artist[128] = {};
     char album[128] = {};
     char device_name[64] = {};
+    char track_uri[64] = {};
+    app::LikeState like_state = app::LikeState::Ready;
     bool has_track = false;
     bool is_playing = false;
     Status status = Status::Booting;
@@ -73,6 +75,7 @@ const char *statusMessage(Status status) {
     switch (status) {
         case Status::Booting:        return "Starting up";
         case Status::WifiConnecting: return "Connecting to WiFi";
+        case Status::SetupRequired:  return "Connect Spotify";
         case Status::Authorizing:    return "Signing in to Spotify";
         case Status::NoActiveDevice: return "Nothing playing";
         case Status::AuthFailed:     return "Sign-in expired";
@@ -92,7 +95,8 @@ void statusHint(const NowPlaying &now, char *out, size_t size) {
                 strlcpy(out, "Start a track on any Spotify device", size);
             }
             return;
-        case Status::AuthFailed:   strlcpy(out, "Re-run tools/spotify_auth.py", size); return;
+        case Status::AuthFailed:   strlcpy(out, "Open setup on your computer", size); return;
+        case Status::SetupRequired:strlcpy(out, "On your PC: 127.0.0.1:8888", size); return;
         case Status::NetworkError: strlcpy(out, "Retrying", size); return;
         default:                   out[0] = '\0'; return;
     }
@@ -201,11 +205,24 @@ void drawButtons(const NowPlaying &now, Button pressed) {
     drawButton(Button::Previous, now.is_playing, pressed == Button::Previous, enabled);
     drawButton(Button::PlayPause, now.is_playing, pressed == Button::PlayPause, enabled);
     drawButton(Button::Next, now.is_playing, pressed == Button::Next, enabled);
+    const bool saveable = now.track_uri[0] && now.status == Status::Playing;
+    const bool saved = now.like_state == app::LikeState::Saved;
+    screen::fillRect(490, 130, 54, 42, kBackground);
+    const bool failed = now.like_state == app::LikeState::Failed || now.like_state == app::LikeState::NeedsAuthorization;
+    const uint16_t heart_color = failed ? rgb(0xFF,0x65,0x65)
+        : saved ? kAccent : now.like_state == app::LikeState::Saving ? rgb(0xF0,0xC0,0x50)
+        : saveable ? kPrimary : kTertiary;
+    if (pressed == Button::Like) screen::fillRoundRect(495,132,42,38,12,kArtPlacehold);
+    auto &g = screen::gfx();
+    g.fillCircle(508, 143, 7, heart_color);
+    g.fillCircle(522, 143, 7, heart_color);
+    g.fillTriangle(501, 144, 529, 144, 515, 161, heart_color);
+    screen::markDirty(490,130,54,42);
 }
 
 void drawStatusLine(const NowPlaying &now, const hardware::Battery &battery) {
-    screen::fillRect(kPrevCx - kButtonRadius, kStatusBaseline - FontSmall.yAdvance,
-                     kStatusRight - kPrevCx + kButtonRadius, FontSmall.yAdvance + 4, kBackground);
+    screen::fillRect(546, kStatusBaseline - FontSmall.yAdvance,
+                     kStatusRight - 546, FontSmall.yAdvance + 4, kBackground);
 
     char line[48] = {};
     if (battery.present) {
@@ -227,12 +244,7 @@ void begin() {
 }
 
 Button hitTest(int16_t x, int16_t y) {
-    if (y < kHitTop || y > kHitBottom) return Button::None;
-    for (Button button : {Button::Previous, Button::PlayPause, Button::Next}) {
-        const int16_t cx = buttonCenterX(button);
-        if (x >= cx - kHitHalfWidth && x <= cx + kHitHalfWidth) return button;
-    }
-    return Button::None;
+    return playerButtonAt(x,y);
 }
 
 void render(const NowPlaying &now, const hardware::Battery &battery, Button pressed) {
@@ -261,7 +273,7 @@ void render(const NowPlaying &now, const hardware::Battery &battery, Button pres
         drawProgress(now, elapsed_ms);
     }
     if (first || pressed != last.pressed || now.is_playing != last.is_playing ||
-        now.status != last.status) {
+        now.status != last.status || now.like_state != last.like_state || strcmp(now.track_uri,last.track_uri) != 0) {
         drawButtons(now, pressed);
     }
     if (first || battery.percent != last.battery_percent ||
@@ -277,6 +289,8 @@ void render(const NowPlaying &now, const hardware::Battery &battery, Button pres
     last.has_track = now.has_track;
     last.is_playing = now.is_playing;
     last.status = now.status;
+    last.like_state = now.like_state;
+    strlcpy(last.track_uri,now.track_uri,sizeof(last.track_uri));
     last.art_generation = art_generation;
     last.art_matched = art_matched;
     last.elapsed_seconds = elapsed_seconds;
@@ -284,6 +298,90 @@ void render(const NowPlaying &now, const hardware::Battery &battery, Button pres
     last.pressed = pressed;
     last.battery_present = battery.present;
     last.battery_percent = battery.percent;
+}
+
+const char *displayedTrackUri() { return last.track_uri; }
+
+namespace {
+void drawMenuClose(bool pressed) {
+    screen::fillRoundRect(558,0,82,38,8,pressed ? kAccent : kTrack);
+    auto &g = screen::gfx();
+    for (int d=0;d<3;++d) {
+        g.drawLine(589+d,9,607+d,27,pressed ? kBackground : kPrimary);
+        g.drawLine(607+d,9,589+d,27,pressed ? kBackground : kPrimary);
+    }
+    screen::markDirty(558,0,82,38);
+}
+}
+
+void drawQuickMenu(bool music, QuickAction pressed, const NowPlaying &now, uint8_t brightness) {
+    screen::fillRect(0,0,screen::kWidth,screen::kHeight,kBackground);
+    screen::drawText(&FontBody,16,24,kSecondary,music ? "Music controls" : "Device controls",400);
+    drawMenuClose(pressed == QuickAction::Close);
+    for (int slot = 0; slot < 3; ++slot) screen::fillRoundRect(16 + slot * 202,40,194,90,8,kArtPlacehold);
+    auto centered = [](int cx, int baseline, const char *text, uint16_t color) {
+        screen::drawText(&FontBody,cx - screen::measure(&FontBody,text)/2,baseline,color,text,190);
+    };
+    auto stepper = [&](int left, QuickAction minus, QuickAction plus) {
+        screen::fillRoundRect(left+4,87,88,38,6,pressed == minus ? kAccent : kTrack);
+        screen::fillRoundRect(left+102,87,88,38,6,pressed == plus ? kAccent : kTrack);
+        centered(left+48,113,"-",pressed == minus ? kBackground : kPrimary);
+        centered(left+146,113,"+",pressed == plus ? kBackground : kPrimary);
+    };
+    char label[32];
+    if (music) {
+        centered(113,61,"Volume",kSecondary);
+        if (now.supports_volume && now.volume_percent >= 0) snprintf(label,sizeof(label),"%d%%",now.volume_percent);
+        else strlcpy(label,"Unavailable",sizeof(label));
+        centered(113,80,label,kPrimary);
+        stepper(16,QuickAction::VolumeDown,QuickAction::VolumeUp);
+        centered(315,65,"Shuffle",kSecondary);
+        centered(315,105,now.shuffle ? "On" : "Off",now.shuffle ? kAccent : kPrimary);
+        centered(517,65,"Repeat",kSecondary);
+        centered(517,105,now.repeat_mode == 2 ? "One song" : now.repeat_mode == 1 ? "All" : "Off",now.repeat_mode ? kAccent : kPrimary);
+        const bool error = now.control_result < 0 || now.control_result >= 300;
+        const char *hint = now.control_pending ? "Updating..." : error ? "Couldn't apply change. Try again or choose another device."
+            : now.control_result >= 200 ? "Updated. Tap X to return to your music." : "Volume changes by 5%. Repeat cycles Off / All / One song.";
+        screen::drawText(&FontSmall,16,158,error ? rgb(0xFF,0x65,0x65) : kTertiary,hint,608);
+    } else {
+        centered(113,78,"Choose",kPrimary);
+        centered(113,104,"device",kPrimary);
+        centered(315,61,"Brightness",kSecondary);
+        snprintf(label,sizeof(label),"%u%%",brightness);
+        centered(315,80,label,kPrimary);
+        stepper(218,QuickAction::BrightDown,QuickAction::BrightUp);
+        centered(517,90,"Shut down",kPrimary);
+        screen::drawText(&FontSmall,16,158,kTertiary,"Tap X to return. Swipe top left for music controls.",608);
+    }
+}
+
+int playlistRowAt(int16_t x, int16_t y) {
+    return playlistShortcutAt(app::kPlaylistCount,x,y);
+}
+
+void drawPlaylists(int pressed, const NowPlaying &now) {
+    screen::fillRect(0,0,screen::kWidth,screen::kHeight,kBackground);
+    const bool playlist_result = now.control_kind == static_cast<uint8_t>(spotify::Command::PlayPlaylist);
+    const bool error = playlist_result && (now.control_result < 0 || now.control_result >= 300);
+    const char *heading = playlist_result && now.control_pending ? "Starting with shuffle..." : error ? "Couldn't start - choose a device"
+        : playlist_result && now.control_result >= 200 ? "Your playlists - shuffle on" : "Your playlists";
+    screen::drawText(&FontBody,16,24,error ? rgb(0xFF,0x65,0x65) : kSecondary,heading,520);
+    drawMenuClose(pressed == -2);
+    if (app::kPlaylistCount == 0) {
+        screen::drawText(&FontBody,16,80,kPrimary,"No playlists added yet",600);
+        screen::drawText(&FontSmall,16,106,kTertiary,"Your chosen playlists will appear here.",600);
+    }
+    for (int index = 0; index < app::kPlaylistCount && index < 8; ++index) {
+        const int y = 40 + (index / 2) * 26;
+        const int x = index % 2 ? 330 : 16;
+        screen::fillRoundRect(x,y,294,24,4,pressed == index ? kAccent : kArtPlacehold);
+        screen::drawText(&FontBody,x+14,y+18,pressed == index ? kBackground : kPrimary,app::kPlaylistShortcuts[index].label,266);
+    }
+    if (app::kPlaylistCount > 8) {
+        screen::fillRoundRect(16,146,608,26,6,pressed == 8 ? kAccent : kArtPlacehold);
+        const char *label = app::kPlaylistShortcuts[8].label;
+        screen::drawText(&FontBody,(640-screen::measure(&FontBody,label))/2,165,pressed == 8 ? kBackground : kPrimary,label,600);
+    }
 }
 
 }  // namespace ui
@@ -294,12 +392,12 @@ namespace ui {
 namespace {
 
 constexpr int16_t kPickerHeaderBaseline = 22;
-constexpr int16_t kRowTop = 32;
-constexpr int16_t kRowHeight = 44;
-constexpr int16_t kRowPitch = 46;
+constexpr int16_t kRowTop = 40;
+constexpr int16_t kRowHeight = 40;
+constexpr int16_t kRowPitch = 42;
 constexpr uint8_t kRowsPerPage = 3;
 constexpr int16_t kRowLeft = 8, kRowRight = 632;
-constexpr int16_t kCloseLeft = 596, kCloseRight = 632, kCloseTop = 2, kCloseBottom = 32;
+constexpr int16_t kCloseLeft = 558, kCloseRight = 639, kCloseTop = 0, kCloseBottom = 38;
 
 bool picker_open = false;
 uint8_t picker_page = 0;
@@ -318,14 +416,7 @@ RenderedPicker last_picker;
 int16_t rowTop(uint8_t slot) { return kRowTop + slot * kRowPitch; }
 
 void drawCloseIcon(uint16_t color) {
-    Arduino_GFX &g = screen::gfx();
-    const int16_t cx = (kCloseLeft + kCloseRight) / 2;
-    const int16_t cy = (kCloseTop + kCloseBottom) / 2;
-    for (int16_t d = 0; d < 2; ++d) {  // two passes for a 2 px stroke
-        g.drawLine(cx - 7 + d, cy - 7, cx + 7 + d, cy + 7, color);
-        g.drawLine(cx + 7 - d, cy - 7, cx - 7 - d, cy + 7, color);
-    }
-    screen::markDirty(kCloseLeft, kCloseTop, kCloseRight - kCloseLeft, kCloseBottom - kCloseTop);
+    drawMenuClose(color == kAccent);
 }
 
 void drawRow(const spotify::Device &device, uint8_t slot, bool pressed, bool preferred) {
@@ -380,6 +471,8 @@ int pickerRowAt(const spotify::DeviceList &list, int16_t x, int16_t y) {
     if (x >= kCloseLeft && x <= kCloseRight && y >= kCloseTop && y <= kCloseBottom) {
         return kPickerClose;
     }
+    if (y >= 2 && y <= 30 && x >= 340 && x <= 445) return kPickerRefresh;
+    if (y >= 2 && y <= 30 && x >= 458 && x <= 550 && list.count > kRowsPerPage) return kPickerNextPage;
     if (x < kRowLeft || x > kRowRight) return kPickerNone;
 
     for (uint8_t slot = 0; slot < kRowsPerPage; ++slot) {
@@ -434,10 +527,12 @@ void renderPicker(const spotify::DeviceList &list, int pressed_index) {
 
     screen::fillRect(0, 0, screen::kWidth, screen::kHeight, kBackground);
     screen::drawText(&FontBody, 16, kPickerHeaderBaseline, kSecondary, "Play on", 300);
+    screen::drawText(&FontSmall,350,kPickerHeaderBaseline,kSecondary,"Refresh",90);
     if (pages > 1) {
         char label[16];
         snprintf(label, sizeof(label), "%u/%u", picker_page + 1, pages);
-        screen::drawTextRight(&FontSmall, kCloseLeft - 18, kPickerHeaderBaseline, kTertiary, label);
+        screen::drawText(&FontSmall,458,kPickerHeaderBaseline,kTertiary,"Next",50);
+        screen::drawTextRight(&FontSmall, kCloseLeft - 6, kPickerHeaderBaseline, kTertiary, label);
     }
     drawCloseIcon(pressed_index == kPickerClose ? kAccent : kSecondary);
 
@@ -446,7 +541,7 @@ void renderPicker(const spotify::DeviceList &list, int pressed_index) {
                                            : "No devices visible to Spotify";
         screen::drawText(&FontBody, 16, rowTop(0) + 28, kTertiary, message, 600);
         screen::drawText(&FontSmall, 16, rowTop(1) + 20, kTertiary,
-                         "Open Spotify on a phone, speaker or computer, then press BOOT again.",
+                         "Open Spotify on a phone, speaker or computer, then tap Refresh.",
                          608);
     } else {
         for (uint8_t slot = 0; slot < kRowsPerPage; ++slot) {

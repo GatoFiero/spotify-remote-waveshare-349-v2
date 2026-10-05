@@ -3,12 +3,17 @@
 #include "../platform/Hardware.h"
 #include "NowPlaying.h"
 #include "SpotifyClient.h"
+#include "TouchTargets.h"
+#include "SwipeDown.h"
 
 namespace ui {
 
-enum class Button : uint8_t { None, Previous, PlayPause, Next };
+const char *displayedTrackUri();
 
 void begin();
+void drawQuickMenu(bool music, QuickAction pressed, const app::NowPlaying &now, uint8_t brightness);
+void drawPlaylists(int pressed, const app::NowPlaying &now);
+int playlistRowAt(int16_t x, int16_t y);
 
 // Which button, if any, is under a logical screen coordinate.
 Button hitTest(int16_t x, int16_t y);
@@ -23,6 +28,8 @@ void render(const app::NowPlaying &now, const hardware::Battery &battery, Button
 
 constexpr int kPickerNone = -1;
 constexpr int kPickerClose = -2;
+constexpr int kPickerRefresh = -3;
+constexpr int kPickerNextPage = -4;
 
 void openPicker();
 void closePicker();

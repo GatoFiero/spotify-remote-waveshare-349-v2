@@ -12,6 +12,11 @@ enum class Command : uint8_t {
     TogglePlayback,
     RefreshDevices,  // re-read what Spotify can currently see
     SelectDevice,    // move playback to a chosen device
+    LikeTrack,
+    SetVolume,
+    SetShuffle,
+    SetRepeat,
+    PlayPlaylist,
 };
 
 constexpr uint8_t kMaxDevices = 8;
@@ -41,6 +46,11 @@ void deviceSnapshot(DeviceList &out);
 
 // Queues a transport command. Returns false only if the queue is full.
 bool send(Command command);
+bool likeTrack(const char *track_uri);
+bool adjustVolume(int8_t delta);
+bool toggleShuffle();
+bool cycleRepeat();
+bool playPlaylist(const char *playlist_uri);
 
 // Queues a move of playback to `device_id`, which also becomes the device the
 // board wakes automatically from then on.

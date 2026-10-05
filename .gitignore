@@ -1,2 +1,18 @@
 .pio/
 src/Secrets.h
+
+local-backup/
+local-state/
+*.log
+
+__pycache__/
+*.pyc
+
+# Notes and restore helpers tied to the original owner's device.
+/LOCAL-SETUP.md
+/tools/restore-original.ps1
+.env
+.env.*
+*.bin
+*.elf
+*.zip

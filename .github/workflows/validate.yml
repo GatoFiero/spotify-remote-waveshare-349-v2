@@ -1,0 +1,25 @@
+name: Validate V2 firmware
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-and-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build tools
+        run: python -m pip install -r requirements.txt
+      - name: Check Python helpers
+        run: python -m compileall -q tools
+      - name: Native input and policy checks
+        run: python tools/run_native_tests.py
+      - name: Build V2 with placeholder credentials
+        run: |
+          cp src/Secrets.example.h src/Secrets.h
+          python -m platformio run -e rev2

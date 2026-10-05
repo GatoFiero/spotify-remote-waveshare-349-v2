@@ -38,6 +38,8 @@ Battery readBattery();
 // Clears the SYS_EN latch. On battery this is the clean power-off; on USB the
 // board stays up regardless.
 bool powerOff();
+// Battery powers off; USB remains powered and the caller uses touch-wake standby.
+void touchscreenPowerOff();
 
 // The user-facing "turn it off". Clears SYS_EN, which on battery ends execution
 // here. If the board is still running afterwards it is on USB, where the latch
